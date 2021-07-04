@@ -1,0 +1,202 @@
+---
+title: "Airbnb Analysis"
+author: "Matteo Biglioli"
+date: "07/06/2021"
+output:
+#  pdf_document: default
+  html_document: default
+header-includes:
+- \usepackage{subfig}
+- \usepackage{bbm}
+urlcolor: blue
+---
+
+```{r echo=FALSE, message=FALSE, include=FALSE}
+# Mapbox stuff
+Sys.setenv('MAPBOX_TOKEN' = 'pk.eyJ1IjoibWF0dGVvYmlnbGlvbGkiLCJhIjoiY2txcGN0cmJ5MDBqdTJvazV6cXdiM2ZqOSJ9.Bd6Gd05464fMSOpqCB-uTw')
+
+# Global vars
+CITIES = c('London', 'Berlin', 'Roma', 'Barcelona', 'Amsterdam', 'Wien')
+
+API_URL = 'https://data.opendatasoft.com/explore/dataset/airbnb-listings@public/download/?format=csv&disjunctive.host_verifications=true&disjunctive.amenities=true&disjunctive.features=true&refine.city=%s&timezone=Europe/Berlin&lang=en&use_labels_for_header=true&csv_separator=%%3B'
+
+MAX_DOWNLOADED_ROWS_PER_CITY = c(50000)
+MAX_ANALISED_ROWS_PER_CITY = c(50000)
+
+DATASET_COLUMNS = c("ID","Name","Experiences.Offered","Host.Since","Host.Response.Time","Host.Response.Rate","City","Latitude","Longitude","Property.Type","Room.Type","Accommodates","Bathrooms","Bedrooms","Beds","Bed.Type","Amenities","Price","Security.Deposit","Cleaning.Fee","Minimum.Nights","Number.of.Reviews","Review.Scores.Rating","Review.Scores.Accuracy","Review.Scores.Cleanliness","Review.Scores.Checkin","Review.Scores.Communication","Review.Scores.Location","Review.Scores.Value","Cancellation.Policy","Features")
+```
+
+```{r}
+# Subselect column after download -> TODO remove
+#for (city in CITIES) {
+#    tmp_df = read.csv(glue::glue("data/airbnb/{city}.csv"))
+#    write.csv(tmp_df %>% select(DATASET_COLUMNS), glue::glue("data/airbnb/{city}.csv"), row.names=FALSE)
+#}
+```
+
+```{r, include=FALSE, message=FALSE,echo=FALSE}
+# Load libraries
+library(glue)
+library(dplyr)
+library(plotly)
+library(leaflet)
+library(pals)
+library(crosstalk)
+
+# Set the current directory as working directory and load custom functions.
+setwd(dirname(rstudioapi::getSourceEditorContext()$path))
+```
+
+```{r, include=FALSE, message=FALSE,echo=FALSE}
+
+# Download data if they are not present
+for (city in CITIES){
+  if (!file.exists(glue::glue("data/airbnb/{city}.csv"))){
+    print(glue::glue("Downloading {city}"))
+    tmp_df = read.csv(sprintf(API_URL, city), sep=';', nrows=MAX_DOWNLOADED_ROWS_PER_CITY)
+    write.csv(tmp_df %>% select(DATASET_COLUMNS), glue::glue("data/airbnb/{city}.csv"), row.names=FALSE)
+  }
+  print(glue::glue("{city} imported."))
+}
+rm(tmp_df)
+```
+
+```{r, include=FALSE, message=FALSE,echo=FALSE}
+
+# Load and clean the full dataset
+df_list = list()
+for (i in seq_along(CITIES)) {
+    df_list[[i]] = read.csv(glue::glue("data/airbnb/{CITIES[[i]]}.csv"), nrows=MAX_ANALISED_ROWS_PER_CITY)
+}
+df = data.table::rbindlist(df_list)
+rm(df_list)
+
+# Remove/Replace NAs and Redefine a column
+df =  df  %>% mutate(Security.Deposit = coalesce(Security.Deposit, 0),
+                      Cleaning.Fee = coalesce(Cleaning.Fee, 0),
+                      Host.ProfilePic = grepl('Host Has Profile Pic', df$Features),
+                      Host.SuperHost = grepl('Host Is Superhost', df$Features),
+                      Host.verified = grepl('Host Identity Verified', df$Features),
+                      Instant_Bookable = grepl('Instant Bookable', df$Features),
+                      Internet = (grepl('Internet', df$Amenities) || grepl('Wireless Internet', df$Amenities)),
+                      Kitchen = grepl('Kitchen', df$Amenities),
+                      Washer = grepl('Washer', df$Amenities),
+                      Breakfast = grepl('Breakfast', df$Amenities),
+                      Air_conditioning = grepl('Air conditioning', df$Amenities),
+                      Host.Since = as.integer(Sys.Date() - as.Date(Host.Since, format = "%Y-%m-%d"))
+                     ) %>%  select(-Features, -Amenities) %>% tidyr::drop_na() 
+
+# Define column types
+df$Experiences.Offered  = factor(df$Experiences.Offered)
+df$Host.Response.Time   = factor(df$Host.Response.Time)
+df$City                 = factor(df$City)
+df$Property.Type        = factor(df$Property.Type)
+df$Room.Type            = factor(df$Room.Type)
+df$Bed.Type             = factor(df$Bed.Type)
+df$Cancellation.Policy  = factor(df$Cancellation.Policy)
+```
+
+```{r}
+# Define column groups
+df_columns = colnames(df)
+host_columns    = df_columns[grepl('Host', df_columns)]
+review_columns  = df_columns[grepl('Review', df_columns)]
+price_columns   = c('Price', 'Security.Deposit', 'Cleaning.Fee', 'Cancellation.Policy')
+services_columns   = c('Instant_Bookable', 'Internet', 'Kitchen', 'Washer', 'Breakfast', 'Air_conditioning', 'Experiences.Offered')
+accomodation_columns   = c('Property.Type', 'Room.Type', 'Accommodates', 'Bathrooms', 'Bedrooms', 'Beds', 'Bed.Type', 'Minimum.Nights')
+
+```
+```{r}
+summary(df[, c('City')])
+summary(df[, ..host_columns])
+summary(df[, ..review_columns])
+summary(df[, ..price_columns])
+summary(df[, ..services_columns])
+summary(df[, ..accomodation_columns])
+
+```
+```{r}
+# Aggregate data to do some plotting
+
+agg_df = df %>% 
+            select(City, Latitude, Longitude, Price) %>%
+            group_by(City) %>%
+            summarise(across(everything(), list(mean))) %>%
+            mutate(lat = Latitude_1,
+                    long = Longitude_1,
+                   price = Price_1)
+```
+
+```{r}
+
+pal <- colorNumeric(
+  palette = "viridis",
+  domain = df$price)
+
+labs <- lapply(seq(nrow(agg_df)), function(i) {
+  paste0( '<p>', '<b>City:</b> ', agg_df[i, "City"][[1]], '<p></p>', 
+          '<b>Avg Price per night:</b> ', round(agg_df[i, "price"], 2), '</p>' ) 
+})
+
+
+m<-leaflet(agg_df) %>% addProviderTiles('CartoDB.Positron') %>% 
+    addCircleMarkers(lng= ~long, lat= ~lat, color= ~pal(price), radius = ~price/5, label = lapply(labs, htmltools::HTML)) %>%
+  addLegend(pal = pal, values = ~price, title = "Average price",
+    labFormat = labelFormat(suffix = "€"), opacity = 1)
+
+fig = plot_ly(df, y = ~Price, color = ~City, type = "box")
+
+p = bscols(m, fig)
+p
+
+```
+```{r}
+
+atmp_df = df %>% filter(City == 'Amsterdam', Price < 250) %>% sample_n(1000)
+batmp_df = df %>% filter(City == 'Barcelona', Price < 250) %>% sample_n(1000)
+betmp_df = df %>% filter(City == 'Berlin', Price < 250) %>% sample_n(1000)
+ltmp_df = df %>% filter(City == 'London', Price < 250) %>% sample_n(1000)
+rtmp_df = df %>% filter(City == 'Roma', Price < 250) %>% sample_n(1000)
+wtmp_df = df %>% filter(City == 'Wien', Price < 250) %>% sample_n(1000)
+
+ma<-leaflet(atmp_df) %>% addProviderTiles('CartoDB.Positron') %>% 
+    addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(Price), radius=1, label=~Price) %>%
+  addLegend(pal = pal, values = ~Price, title = "Average price",
+    labFormat = labelFormat(suffix = "€"))
+
+mba<-leaflet(batmp_df) %>% addProviderTiles('CartoDB.Positron') %>% 
+    addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(Price), radius=1, label=~Price) %>%
+  addLegend(pal = pal, values = ~Price, title = "Average price",
+    labFormat = labelFormat(suffix = "€"))
+
+p1 = bscols(ma, mba)
+
+mbe<-leaflet(betmp_df) %>% addProviderTiles('CartoDB.Positron') %>% 
+    addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(Price), radius=1, label=~Price) %>%
+  addLegend(pal = pal, values = ~Price, title = "Average price",
+    labFormat = labelFormat(suffix = "€"))
+
+ml<-leaflet(ltmp_df) %>% addProviderTiles('CartoDB.Positron') %>% 
+    addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(Price), radius=1, label=~Price) %>%
+  addLegend(pal = pal, values = ~Price, title = "Average price",
+    labFormat = labelFormat(suffix = "€"))
+
+p2 = bscols(mbe, ml)
+
+mr<-leaflet(rtmp_df) %>% addProviderTiles('CartoDB.Positron') %>% 
+    addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(Price), radius=1, label=~Price) %>%
+  addLegend(pal = pal, values = ~Price, title = "Average price",
+    labFormat = labelFormat(suffix = "€"))
+
+mw<-leaflet(wtmp_df) %>% addProviderTiles('CartoDB.Positron') %>% 
+    addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(Price), radius=1, label=~Price) %>%
+  addLegend(pal = pal, values = ~Price, title = "Average price",
+    labFormat = labelFormat(suffix = "€"))
+
+p3 = bscols(mr, mw)
+
+p1
+p2
+p3
+
+```
