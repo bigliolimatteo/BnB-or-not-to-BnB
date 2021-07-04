@@ -200,3 +200,16 @@ p2
 p3
 
 ```
+TODO
+- Compute distance_from_center column
+- show better stats/graphs on group of columns (as did above)
+- compute correlation matrix (qualitative and quantitative) to show what drives prices (and if it differs by city)
+- Exclude useless columns by correlation above or PCA
+- try clustering by city and clustering the entire dataset to show if changes
+- try and predict a price of something
+- evaluate model
+- Try and predict the city of a room based on other charateristics
+- try clusters with and w/out prices and see if prices variance is small in the clusters
+- Try and predict the review scores
+- 
+
