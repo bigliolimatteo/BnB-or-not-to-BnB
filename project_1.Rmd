@@ -20,8 +20,8 @@ CITIES = c('London', 'Berlin', 'Roma', 'Barcelona', 'Amsterdam', 'Wien')
 
 API_URL = 'https://data.opendatasoft.com/explore/dataset/airbnb-listings@public/download/?format=csv&disjunctive.host_verifications=true&disjunctive.amenities=true&disjunctive.features=true&refine.city=%s&timezone=Europe/Berlin&lang=en&use_labels_for_header=true&csv_separator=%%3B'
 
-MAX_DOWNLOADED_ROWS_PER_CITY = c(50000)
-MAX_ANALISED_ROWS_PER_CITY = c(50000)
+MAX_DOWNLOADED_ROWS_PER_CITY = c(5000)
+MAX_ANALISED_ROWS_PER_CITY = c(5000)
 
 DATASET_COLUMNS = c("ID","Name","Experiences.Offered","Host.Since","Host.Response.Time","Host.Response.Rate","City","Latitude","Longitude","Property.Type","Room.Type","Accommodates","Bathrooms","Bedrooms","Beds","Bed.Type","Amenities","Price","Security.Deposit","Cleaning.Fee","Minimum.Nights","Number.of.Reviews","Review.Scores.Rating","Review.Scores.Accuracy","Review.Scores.Cleanliness","Review.Scores.Checkin","Review.Scores.Communication","Review.Scores.Location","Review.Scores.Value","Cancellation.Policy","Features")
 ```
@@ -40,14 +40,22 @@ library(glue)
 library(dplyr)
 library(plotly)
 library(leaflet)
-library(pals)
 library(crosstalk)
+library(GoodmanKruskal)
+library(Hmisc)
+library(corrplot)
+library(geodist)
+library(factoextra)
+library(gridExtra)
 
 # Set the current directory as working directory and load custom functions.
 setwd(dirname(rstudioapi::getSourceEditorContext()$path))
 ```
 
 ```{r, include=FALSE, message=FALSE,echo=FALSE}
+# Create data dir if not exists
+dir.create(file.path(getwd(), 'data'), showWarnings = FALSE)
+dir.create(file.path(paste0(getwd(), '/data'), 'airbnb'), showWarnings = FALSE)
 
 # Download data if they are not present
 for (city in CITIES){
@@ -63,6 +71,18 @@ rm(tmp_df)
 
 ```{r, include=FALSE, message=FALSE,echo=FALSE}
 
+if (TRUE){
+  df = read.csv('debug.csv')
+    # Define column types
+  df$Experiences.Offered  = factor(df$Experiences.Offered)
+  df$Host.Response.Time   = factor(df$Host.Response.Time)
+  df$City                 = factor(df$City)
+  df$Property.Type        = factor(df$Property.Type)
+  df$Room.Type            = factor(df$Room.Type)
+  df$Bed.Type             = factor(df$Bed.Type)
+  df$Cancellation.Policy  = factor(df$Cancellation.Policy)
+
+} else {
 # Load and clean the full dataset
 df_list = list()
 for (i in seq_along(CITIES)) {
@@ -71,20 +91,33 @@ for (i in seq_along(CITIES)) {
 df = data.table::rbindlist(df_list)
 rm(df_list)
 
+euc.dist <- function(x1, x2) sqrt(sum((x1 - x2) ^ 2))
+
+# TODO implement w/ Rcpp
+df = df %>% rowwise() %>% mutate(
+     dist_from_city_center = case_when(
+         City == 'London' ~ geodist(c(-0.109852, 51.510257), c(Longitude,Latitude)),
+         City == 'Barcelona' ~ geodist(c(2.179218, 41.406116), c(Longitude,Latitude)),
+         City == 'Roma' ~ geodist(c(12.490288, 41.897881), c(Longitude,Latitude)),
+         City == 'Amsterdam' ~ geodist(c(4.895747, 52.375059), c(Longitude,Latitude)),
+         City == 'Wien' ~ geodist(c(16.372340, 48.211068), c(Longitude,Latitude)),
+         City == 'Berlin' ~ geodist(c(13.401755, 52.517132), c(Longitude,Latitude))
+     )
+)
+     
 # Remove/Replace NAs and Redefine a column
-df =  df  %>% mutate(Security.Deposit = coalesce(Security.Deposit, 0),
+df =  df  %>% ungroup() %>% mutate(Security.Deposit = coalesce(Security.Deposit, 0),
                       Cleaning.Fee = coalesce(Cleaning.Fee, 0),
                       Host.ProfilePic = grepl('Host Has Profile Pic', df$Features),
                       Host.SuperHost = grepl('Host Is Superhost', df$Features),
                       Host.verified = grepl('Host Identity Verified', df$Features),
                       Instant_Bookable = grepl('Instant Bookable', df$Features),
-                      Internet = (grepl('Internet', df$Amenities) || grepl('Wireless Internet', df$Amenities)),
                       Kitchen = grepl('Kitchen', df$Amenities),
                       Washer = grepl('Washer', df$Amenities),
                       Breakfast = grepl('Breakfast', df$Amenities),
                       Air_conditioning = grepl('Air conditioning', df$Amenities),
                       Host.Since = as.integer(Sys.Date() - as.Date(Host.Since, format = "%Y-%m-%d"))
-                     ) %>%  select(-Features, -Amenities) %>% tidyr::drop_na() 
+                     ) %>%  select(-Features, -Amenities) %>% tidyr::drop_na() %>% filter(Number.of.Reviews > 10)
 
 # Define column types
 df$Experiences.Offered  = factor(df$Experiences.Offered)
@@ -94,7 +127,9 @@ df$Property.Type        = factor(df$Property.Type)
 df$Room.Type            = factor(df$Room.Type)
 df$Bed.Type             = factor(df$Bed.Type)
 df$Cancellation.Policy  = factor(df$Cancellation.Policy)
+}
 ```
+
 
 ```{r}
 # Define column groups
@@ -102,17 +137,17 @@ df_columns = colnames(df)
 host_columns    = df_columns[grepl('Host', df_columns)]
 review_columns  = df_columns[grepl('Review', df_columns)]
 price_columns   = c('Price', 'Security.Deposit', 'Cleaning.Fee', 'Cancellation.Policy')
-services_columns   = c('Instant_Bookable', 'Internet', 'Kitchen', 'Washer', 'Breakfast', 'Air_conditioning', 'Experiences.Offered')
+services_columns   = c('Instant_Bookable', 'Kitchen', 'Washer', 'Breakfast', 'Air_conditioning', 'Experiences.Offered')
 accomodation_columns   = c('Property.Type', 'Room.Type', 'Accommodates', 'Bathrooms', 'Bedrooms', 'Beds', 'Bed.Type', 'Minimum.Nights')
 
 ```
 ```{r}
 summary(df[, c('City')])
-summary(df[, ..host_columns])
-summary(df[, ..review_columns])
-summary(df[, ..price_columns])
-summary(df[, ..services_columns])
-summary(df[, ..accomodation_columns])
+summary(df[, host_columns])
+summary(df[, review_columns])
+summary(df[, price_columns])
+summary(df[, services_columns])
+summary(df[, accomodation_columns])
 
 ```
 ```{r}
@@ -151,65 +186,215 @@ p
 
 ```
 ```{r}
+plot_ly(df, y = ~Bedrooms, color = ~City, type = "box")
+plot_ly(df, y = ~Accommodates, color = ~City, type = "box")
+plot_ly(df, y = ~Beds, color = ~City, type = "box")
+plot_ly(df, y = ~Bathrooms, color = ~City, type = "box")
+plot_ly(df, y = ~Bedrooms, type = "box")
+plot_ly(df, y = ~Accommodates, type = "box")
+plot_ly(df, y = ~Beds, type = "box")
+plot_ly(df, y = ~Bathrooms, type = "box")
+```
+```{r}
+plot_ly(df, y = ~Review.Scores.Rating, color = ~City, type = "box")
+plot_ly(df, y = ~Review.Scores.Accuracy, color = ~City, type = "box")
+plot_ly(df, y = ~Review.Scores.Cleanliness, color = ~City, type = "box")
+plot_ly(df, y = ~Review.Scores.Checkin, color = ~City, type = "box")
+plot_ly(df, y = ~Review.Scores.Communication, color = ~City, type = "box")
+plot_ly(df, y = ~Review.Scores.Location, color = ~City, type = "box")
+plot_ly(df, y = ~Review.Scores.Value, color = ~City, type = "box")
+```
 
-atmp_df = df %>% filter(City == 'Amsterdam', Price < 250) %>% sample_n(1000)
-batmp_df = df %>% filter(City == 'Barcelona', Price < 250) %>% sample_n(1000)
-betmp_df = df %>% filter(City == 'Berlin', Price < 250) %>% sample_n(1000)
-ltmp_df = df %>% filter(City == 'London', Price < 250) %>% sample_n(1000)
-rtmp_df = df %>% filter(City == 'Roma', Price < 250) %>% sample_n(1000)
-wtmp_df = df %>% filter(City == 'Wien', Price < 250) %>% sample_n(1000)
+```{r}
 
-ma<-leaflet(atmp_df) %>% addProviderTiles('CartoDB.Positron') %>% 
-    addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(Price), radius=1, label=~Price) %>%
-  addLegend(pal = pal, values = ~Price, title = "Average price",
+# Define plots
+map_list = list()
+for (i in seq_along(CITIES)) {
+  
+  tmp_df = df %>% filter(City == CITIES[[i]], Price < 250) %>% sample_n(1000)
+
+    tmp_labs <- lapply(seq(nrow(tmp_df)), function(i) {
+    paste0( '<b>Avg Price per night:</b> ', round(tmp_df[i, "Price"], 2), '<br/>',
+            '<b>Dist from center:</b> ', round(tmp_df[i, "dist_from_city_center"], 2)) 
+  })
+
+  tmp_map <-leaflet(tmp_df) %>% addProviderTiles('CartoDB.Positron') %>% 
+    addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(Price), radius=1, label = lapply(tmp_labs, htmltools::HTML)) %>%
+    addLegend(pal = pal, values = ~Price, title = "Average price",
     labFormat = labelFormat(suffix = "€"))
+  
+  map_list[[i]] = tmp_map
+}
 
-mba<-leaflet(batmp_df) %>% addProviderTiles('CartoDB.Positron') %>% 
-    addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(Price), radius=1, label=~Price) %>%
-  addLegend(pal = pal, values = ~Price, title = "Average price",
-    labFormat = labelFormat(suffix = "€"))
+# Combine plots
+p1 = bscols(map_list[[1]], map_list[[2]])
+p2 = bscols(map_list[[3]], map_list[[4]])
+p3 = bscols(map_list[[5]], map_list[[6]])
 
-p1 = bscols(ma, mba)
-
-mbe<-leaflet(betmp_df) %>% addProviderTiles('CartoDB.Positron') %>% 
-    addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(Price), radius=1, label=~Price) %>%
-  addLegend(pal = pal, values = ~Price, title = "Average price",
-    labFormat = labelFormat(suffix = "€"))
-
-ml<-leaflet(ltmp_df) %>% addProviderTiles('CartoDB.Positron') %>% 
-    addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(Price), radius=1, label=~Price) %>%
-  addLegend(pal = pal, values = ~Price, title = "Average price",
-    labFormat = labelFormat(suffix = "€"))
-
-p2 = bscols(mbe, ml)
-
-mr<-leaflet(rtmp_df) %>% addProviderTiles('CartoDB.Positron') %>% 
-    addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(Price), radius=1, label=~Price) %>%
-  addLegend(pal = pal, values = ~Price, title = "Average price",
-    labFormat = labelFormat(suffix = "€"))
-
-mw<-leaflet(wtmp_df) %>% addProviderTiles('CartoDB.Positron') %>% 
-    addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(Price), radius=1, label=~Price) %>%
-  addLegend(pal = pal, values = ~Price, title = "Average price",
-    labFormat = labelFormat(suffix = "€"))
-
-p3 = bscols(mr, mw)
-
+# Show plots
 p1
 p2
 p3
 
 ```
-TODO
-- Compute distance_from_center column
+```{r}
 - show better stats/graphs on group of columns (as did above)
-- compute correlation matrix (qualitative and quantitative) to show what drives prices (and if it differs by city)
-- Exclude useless columns by correlation above or PCA
-- try clustering by city and clustering the entire dataset to show if changes
-- try and predict a price of something
+```
+```{r, fig.height=2.5}
+#- compute correlation matrix (qualitative and quantitative) to show what drives prices (and if it differs by city)
+quantitative_vars = c("Host.Since","Host.Response.Rate","Accommodates","Bathrooms","Bedrooms","Beds","Price","Security.Deposit","Cleaning.Fee","Number.of.Reviews","Review.Scores.Rating","Review.Scores.Accuracy","Review.Scores.Cleanliness","Review.Scores.Checkin","Review.Scores.Communication","Review.Scores.Location","Review.Scores.Value","dist_from_city_center")
+
+corr <- rcorr(as.matrix(df %>% dplyr::select(all_of(quantitative_vars))))
+colnames(corr$r) <- quantitative_vars
+corrplot(corr$r, type = "upper", tl.col = "black", tl.srt = 45, tl.cex = .5)
+```
+```{r, fig.height=4}
+#- compute correlation matrix (qualitative and quantitative) to show what drives prices (and if it differs by city)
+qualitative_vars = c("Experiences.Offered","City","Property.Type","Room.Type","Bed.Type","Cancellation.Policy","Host.ProfilePic","Host.SuperHost","Host.verified","Instant_Bookable","Kitchen","Washer","Breakfast","Air_conditioning")
+
+df$Host.ProfilePic  = factor(df$Host.ProfilePic)
+df$Host.SuperHost   = factor(df$Host.SuperHost)
+df$Host.verified    = factor(df$Host.verified)
+df$Instant_Bookable = factor(df$Instant_Bookable)
+df$Kitchen          = factor(df$Kitchen)
+df$Washer           = factor(df$Washer)
+df$Breakfast        = factor(df$Breakfast)
+df$Air_conditioning = factor(df$Air_conditioning)
+
+plot(GKtauDataframe(df %>% dplyr::select(all_of(qualitative_vars))))
+```
+```{r}
+#library(leaps)
+#regfit.full=regsubsets(crim~.,data=Boston, nvmax=13) ## default is 8
+#reg.summary=summary(regfit.full)
+#names(reg.summary)
+
+#- Exclude useless columns by correlation above or PCA
+library(parameters)
+m_stepwise <- lm(Price ~., df %>% select(-X, -ID, -Name))
+m_stepwise <- select_parameters(m_stepwise)
+  
+summary(m_stepwise)
+```
+```{r}
+# PCA
+quantitative_vars_pca = c("Host.Since","Host.Response.Rate","Price","Security.Deposit","Cleaning.Fee","Number.of.Reviews","Review.Scores.Rating","dist_from_city_center")
+df_pca <- scale(df %>% filter(City== 'Amsterdam') %>% dplyr::select(all_of(quantitative_vars_pca)) %>% select(-Price))
+pca <- FactoMineR::PCA(df_pca, graph=TRUE)
+fviz_screeplot(pca, addlabels=TRUE )
+pca_res = prcomp(df_pca)
+autoplot(pca_res)
+```
+```{r, fig.height=4}
+#- try clustering by city and clustering the entire dataset to show if changes
+
+
+#fviz_screeplot(pca, addlabels=TRUE )
+#fviz_pca_var(pca, col.var ="contrib", gradient.cols = c("pink", "violet", "blue"),
+#             repel=TRUE)
+c1 = fviz_contrib(pca, choice='var', axes=1, top=10)
+c2 = fviz_contrib(pca, choice='var', axes=2, top=10)
+c3 = fviz_contrib(pca, choice='var', axes=3, top=10)
+c4 = fviz_contrib(pca, choice='var', axes=4, top=10)
+grid.arrange(c1, c2, c3, c4,  nrow = 2)
+```
+```{r}
+fviz_screeplot(pca, addlabels=TRUE )
+#fviz_pca_var(pca, col.var ="contrib", gradient.cols = c("pink", "violet", "blue"),
+#             repel=TRUE)
+```
+```{r}
+fviz_pca_var(pca, col.var ="contrib", gradient.cols = c("green", "brown", "blue"), repel=TRUE)
+```
+```{r}
+library(ggplot2)
+library(ggfortify)
+pca_res = prcomp(df_pca)
+autoplot(pca_res)
+```
+```{r}
+k.means.fit = kmeans(df_pca, 3) # k = 3
+
+wssplot <- function(df, nc=15, seed=1234){
+  wss <- (nrow(dati)-1)*sum(apply(df,2,var))
+  for (i in 2:nc){
+    set.seed(seed)
+    wss[i] <- sum(kmeans(df, centers=i)$withinss)}
+  plot(1:nc, wss, type="b", xlab="Number of Clusters",
+       ylab="Within groups sum of squares")}
+
+wssplot(dati.stand, nc=3)
+summary(dati[k.means.fit$cluster==1,"women_parl"])
+summary(dati[k.means.fit$cluster==2,"women_parl"])
+summary(dati[k.means.fit$cluster==3,"women_parl"])
+
+boxplot(dati$women_parl ~ k.means.fit$cluster)
+
+library(cluster)
+tmp_df = df %>% dplyr::select(all_of(quantitative_vars))%>% sample_n(1000)
+k.means.fit = kmeans(df_pca, 2) # k = 3
+clusplot(df_pca, k.means.fit$cluster, main='Cluster representation', color=TRUE, shade=TRUE, labels=2, lines=0)
+
+```
+```{r}
+library(cluster)
+tmp_df = df %>% sample_n(1000) 
+d <- cluster::daisy(tmp_df %>% select (-X, -ID, -Name, -City, -Latitude, -Longitude), metric = "gower") # Euclidean distance matrix.
+H.fit <- hclust(d, method="ward.D2")
+plot(H.fit) # display dendogram
+groups <- cutree(H.fit, k=3) # cut tree into 3 clusters
+# draw dendogram with red borders around the 3 clusters
+rect.hclust(H.fit, k=3, border="red")
+
+map_df = tmp_df
+map_df$label = groups
+
+pal <- colorNumeric(
+  palette = "viridis",
+  domain = map_df$label)
+
+
+tmp_map <-leaflet(map_df) %>% addProviderTiles('CartoDB.Positron') %>% 
+addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(label), radius=1, label =  ~label) %>%
+addLegend(pal = pal, values = ~label, title = "Average price",
+labFormat = labelFormat())
+  tmp_map
+  
+map_df$label = factor(map_df$label)
+plot_ly(map_df, y = ~Host.Since, color = ~label, type = "box")
+plot_ly(map_df, y = ~Accommodates, color = ~label, type = "box")
+plot_ly(map_df, y = ~Security.Deposit, color = ~label, type = "box")
+plot_ly(map_df, y = ~Review.Scores.Rating, color = ~label, type = "box")
+plot_ly(map_df, y = ~Review.Scores.Rating, color = ~label, type = "box")
+plot_ly(map_df, y = ~Review.Scores.Rating, color = ~label, type = "box")
+```
+```{r}
+clusterdata.mean<-function(data,groups){
+  aggregate(data,list(groups),function(x)mean(as.numeric(x)))
+}
+
+clusterdata.mean(map_df,map_df$label)
+-# try and predict a price of something
+```
+```{r}
 - evaluate model
+```
+```{r}
 - Try and predict the city of a room based on other charateristics
+```
+```{r}
 - try clusters with and w/out prices and see if prices variance is small in the clusters
+```
+```{r}
 - Try and predict the review scores
-- 
+
+
+```
+sub selection
+linear model
+Residui normali
+logit
+knn su bin della continuous var 
+cluster
+finals
 
