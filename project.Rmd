@@ -1,0 +1,845 @@
+---
+title: "Airbnb Analysis"
+author: "Matteo Biglioli"
+date: "07/06/2021"
+output:
+  html_document: default
+header-includes:
+- \usepackage{subfig}
+- \usepackage{bbm}
+urlcolor: blue
+abstract: |
+  This paper will present a complete statistical analysis of Airbnb data from six major european cities. We start by presenting an exploratory analysis of our dataset, in which we try to identify both the most relevant components that drive prices and possible differences between the collected cities. We then evaluate different statistical learning models that predict the prices given different instrumental variables. At the end we generate different clusters both from the whole dataset and from subset related to single cities, to better understand the composition of the dataset.
+  
+  We find that the most important drivers for prices are (apart from the actual city in which is located the property) the type of the room, weather is shared or private, and the number of guests that can stay at the property, the higher the number, the lower the price. These main variables are followed by others like the rating of the property, the number of bathrooms and the presence of air conditioning.
+  
+  We estimated a simple pruned tree, a Random Forest and a Boosted tree model which achieve a Root Mean Squared Error from 80 to 73.
+  
+  We finally try and cluster our data but we find that the clusters have no actual grographical interpretation.
+---
+# 1. Introduction
+
+Airbnb is an American company that operates an online marketplace for lodging, primarily homestays for vacation rentals, and tourism activities. It was born in 2007 and, since then, it has grown to 4 million Hosts who have welcomed more than 900 million guest arrivals in almost every country across the globe.
+The app works as most of the other bookings apps: a client can just select a city he/she want to visit, the dates of the trip and he/she will get a list of possible locations. 
+
+The main feature that makes Airbnb unique in its kind is that in the website you can find not only hotels and apartments, but also single rooms that are rented out for a few days from private Hosts.
+
+In this kind of environment Hosts are pushed to compete in an almost-free market, where they have to set the right price for their properties in order to stay competitive and win guests over.
+We can assume that a good percentage of private Hosts has no experience in both Marketing and Real-Estate, hence the definition of the right price could become a entry barrier that stops most of them from ever trying to compete.
+
+Our goal in this paper will be to understand which are the components that drive prices and to construct a model that can help both Hosts to define the right price for their properties and Guests to check weather a location is truthfully priced.
+
+```{r echo=FALSE, message=FALSE, include=FALSE}
+## Global vars
+CITIES = c('London', 'Berlin', 'Roma', 'Barcelona', 'Amsterdam', 'Wien')
+
+API_URL = 'https://data.opendatasoft.com/explore/dataset/airbnb-listings@public/download/?format=csv&disjunctive.host_verifications=true&disjunctive.amenities=true&disjunctive.features=true&refine.city=%s&timezone=Europe/Berlin&lang=en&use_labels_for_header=true&csv_separator=%%3B'
+
+MAX_DOWNLOADED_ROWS_PER_CITY = c(5000)
+MAX_ANALISED_ROWS_PER_CITY = c(5000)
+
+DATASET_COLUMNS = c("ID","Name","Experiences.Offered","Host.Since","Host.Response.Time","Host.Response.Rate","City","Latitude","Longitude","Property.Type","Room.Type","Accommodates","Bathrooms","Bedrooms","Beds","Bed.Type","Amenities","Price","Security.Deposit","Cleaning.Fee","Minimum.Nights","Number.of.Reviews","Review.Scores.Rating","Review.Scores.Accuracy","Review.Scores.Cleanliness","Review.Scores.Checkin","Review.Scores.Communication","Review.Scores.Location","Review.Scores.Value","Cancellation.Policy","Features")
+```
+
+
+```{r, include=FALSE, message=FALSE,echo=FALSE}
+
+# Install libraries
+if(!require('pacman'))install.packages('pacman')
+pacman::p_load(rpart, rpart.plot,party, partykit, stringr, PerformanceAnalytics, summarytools, glue,dplyr,plotly,leaflet,crosstalk,GoodmanKruskal,Hmisc,corrplot,geodist,factoextra,gridExtra)
+
+# Load libraries
+library(glue)
+library(dplyr)
+library(plotly)
+library(leaflet)
+library(crosstalk)
+library(GoodmanKruskal)
+library(Hmisc)
+library(corrplot)
+library(geodist)
+library(factoextra)
+library(summarytools)
+library(gridExtra)
+library(stringr)
+library(PerformanceAnalytics)
+library(partykit)
+library(party)
+library(rpart)
+library(rpart.plot)
+library(ggfortify)
+library(ggplot2)
+library(cluster)
+library(randomForest)
+library(gbm)
+
+# Set the current directory as working directory and load custom functions.
+setwd(dirname(rstudioapi::getSourceEditorContext()$path))
+```
+
+```{r, include=FALSE, message=FALSE,echo=FALSE}
+
+# Create data dir if not exists
+dir.create(file.path(getwd(), 'data'), showWarnings = FALSE)
+dir.create(file.path(paste0(getwd(), '/data'), 'airbnb'), showWarnings = FALSE)
+
+# Download data if they are not present
+for (city in CITIES){
+  if (!file.exists(glue::glue("data/airbnb/{city}.csv"))){
+    print(glue::glue("Downloading {city}"))
+    tmp_df = read.csv(sprintf(API_URL, city), sep=';', nrows=MAX_DOWNLOADED_ROWS_PER_CITY)
+    write.csv(tmp_df %>% select(DATASET_COLUMNS), glue::glue("data/airbnb/{city}.csv"), row.names=FALSE)
+  }
+  print(glue::glue("{city} imported."))
+}
+# Clean temporary variables
+rm(tmp_df)
+```
+
+```{r, include=FALSE, message=FALSE,echo=FALSE}
+## Load different cities and merge into full dataset
+df_list = list()
+for (i in seq_along(CITIES)) {
+    df_list[[i]] = read.csv(glue::glue("data/airbnb/{CITIES[[i]]}.csv"), nrows=MAX_ANALISED_ROWS_PER_CITY)
+}
+df = data.table::rbindlist(df_list)
+rm(df_list)
+
+## Split columns with list of feature
+df =  df %>% mutate(Cancellation.Policy = str_replace(Cancellation.Policy, "_new",""))
+
+## Split columns with list of feature
+df =  df %>% mutate(Host.ProfilePic  = grepl('Host Has Profile Pic',   df$Features),
+                    Host.SuperHost   = grepl('Host Is Superhost',      df$Features),
+                    Host.verified    = grepl('Host Identity Verified', df$Features),
+                    Instant_Bookable = grepl('Instant Bookable',       df$Features),
+                    Kitchen          = grepl('Kitchen',                df$Amenities),
+                    Washer           = grepl('Washer',                 df$Amenities),
+                    Breakfast        = grepl('Breakfast',              df$Amenities),
+                    Air_conditioning = grepl('Air conditioning',       df$Amenities),
+                   ) %>%  select(-Features, -Amenities)
+
+
+## Define zero where no Cleaning Fee or Security Desposit is required
+## Redefine Host.Since as a column we can work with
+df =  df %>% mutate(Security.Deposit = coalesce(Security.Deposit, 0),
+                    Cleaning.Fee     = coalesce(Cleaning.Fee, 0),
+                    Host.Since       = as.integer(Sys.Date() - as.Date(Host.Since, format = "%Y-%m-%d"))
+                  ) 
+
+
+## Drop Nas and select only airbnbs with at least 10 reviews
+df =  df %>% tidyr::drop_na() %>% filter(Number.of.Reviews > 10)
+
+
+## Define column types
+df$Experiences.Offered  = factor(df$Experiences.Offered)
+df$Host.Response.Time   = factor(df$Host.Response.Time)
+df$City                 = factor(df$City)
+df$Property.Type        = factor(df$Property.Type)
+df$Room.Type            = factor(df$Room.Type)
+df$Bed.Type             = factor(df$Bed.Type)
+df$Cancellation.Policy  = factor(df$Cancellation.Policy)
+
+```
+
+# 2. Data
+
+```{r, include=FALSE}
+# Define column groups
+df_columns = colnames(df)
+host_columns    = df_columns[grepl('Host', df_columns)]
+review_columns  = df_columns[grepl('Review', df_columns)]
+price_columns   = c('Price', 'Security.Deposit', 'Cleaning.Fee')
+services_columns   = c('Instant_Bookable', 'Kitchen', 'Washer', 'Breakfast', 'Air_conditioning', 'Experiences.Offered', 'Cancellation.Policy')
+accomodation_columns   = c('Property.Type', 'Room.Type', 'Accommodates', 'Bathrooms', 'Bedrooms', 'Beds', 'Bed.Type', 'Minimum.Nights')
+```
+
+We start our analysis by presenting our dataset. Before diving into the actual variables we present the six different cities and the related number of records:
+```{r, echo=FALSE, fig.align = 'center'}
+df_cities = df %>% count(City)
+plot_ly(df_cities, type='pie', labels=~City, values=~n, textinfo='label+percent',insidetextorientation='radial')
+```
+
+For a better understanding we splitted the variables into five different groups that will be presented below.
+
+### 2.1 Host-related variables
+
+These variables are related to features of the hosts, we have:
+
+  * **Host.Since**: number of days since the Host is present on the platform.
+  * **Host.Response.Time**: average response time of the Host.
+  * **Host.Response.Rate**: average rate of responses of the Host.
+  * **Host.ProfilePic**: weather the Host has a profile pic.
+  * **Host.SuperHost**:  weather the Host is a SuperHost.
+  * **Host.verified**:  weather the Host is verified.
+```{r, echo=FALSE}
+summary(df[, ..host_columns])
+```
+
+  
+### 2.2 Review-related variables
+
+These variables are related to the different reviews, we have:
+
+  * **Number.of.Reviews**: number of reviews of the property.
+  * **Review.Scores.Rating**: overall rating (1-100).
+  * **Review.Scores.Accuracy**: rating related to the accuracy of the host.
+  * **Review.Scores.Cleanliness**: rating related to the cleanliness of the host.
+  * **Review.Scores.Checkin**: rating related to checkin.
+  * **Review.Scores.Communication**: rating related to the communication of the host.
+  * **Review.Scores.Location**: rating related to the location.
+  * **Review.Scores.Value**: overall rating (1-10).
+```{r, echo=FALSE}
+summary(df[, ..review_columns])
+```
+
+
+### 2.3 Price-related variables
+
+These variables are related to prices and fees, we have:
+
+  * **Price**: price per night.
+  * **Security.Deposit**: eventual security deposit (if NA, is set to 0).
+  * **Cleaning.Fee**: eventual cleaning fee, una tantum (if NA, is set to 0).
+```{r, echo=FALSE}
+summary(df[, ..price_columns])
+```
+
+  
+### 2.4 Services-related variables
+
+These variables are related to services included in booking, we have:
+
+  * **Instant_Bookable**: weather a property is instantly bookable (without hosts' confirmation).
+  * **Kitchen**: weather a kitchen is avaiable.
+  * **Washer**: weather a washer is avaiable.
+  * **Breakfast**: weather breakfast is included.
+  * **Air_conditioning**:  weather air conditioning is avaiable.
+  * **Experiences.Offered**:  kind of experience (romantic, business, ...).
+  * **Cancellation.Policy**:  cancellation policy (fees, ...).
+  * **Minimum.Nights**: minumin number of nights to spend at the property.
+```{r, echo=FALSE}
+summary(df[, ..services_columns])
+```
+  
+    
+### 2.5 Accomodation-related variables
+
+These variables are related to the actual location, we have:
+
+  * **Property.Type**: type of the property.
+  * **Room.Type**: type of the room.
+  * **Accommodates**: number of people that can stay at the property.
+  * **Bathrooms**: number of bathrooms.
+  * **Bedrooms**:  number of bedrooms
+  * **Beds**:  number of beds
+  * **Bed.Type**:  type of the beds
+
+```{r, echo=FALSE}
+summary(df[, ..accomodation_columns])
+```
+# 3. Definition of the dependent variable
+The main goal of this analysis is to find what drive prices, the main issue we need to address before diving in is: **How do we define *Price*?**.
+
+We observe that there are different variables related to prices and fees, that are:
+
+ * Total price per night
+ * Cleaning fee
+ * Security deposit
+
+For the scope of this paper we decide that we will define price as the per-person price of a seven-night stay at the property, computed as: 
+
+```{r}
+# Compute new price and remove useless columns
+df = df %>% mutate(Price = (7*Price + Cleaning.Fee)/Accommodates) %>% select(-Cleaning.Fee)
+```
+
+# 4. Exploratory analysis
+
+We now present our dataset in a more sofisticated way, focusing on the relationships between the different variables that we collected and the prices.
+
+We start by showing how prices differs by city:
+```{r, echo=FALSE}
+# Aggregate data to do some plotting
+agg_df = df %>% select(City, Latitude, Longitude, Price) %>%
+                group_by(City) %>%
+                summarise(across(everything(), list(mean))) %>%
+                mutate(lat = Latitude_1, long = Longitude_1, price = Price_1) %>%
+                select(City, lat, long, price)
+```
+
+```{r, echo=FALSE}
+# Prepare palette
+pal <- colorNumeric(
+  palette = "viridis",
+  domain = df$price)
+
+# Prepare labels
+labs <- lapply(seq(nrow(agg_df)), function(i) {
+  paste0( '<p>', '<b>City:</b> ', agg_df[i, "City"][[1]], '<p></p>', 
+          '<b>Avg Price - 7 nights:</b> ', round(agg_df[i, "price"], 2), '€</p>' ) 
+})
+
+# Construct map
+m<-leaflet(agg_df) %>% addProviderTiles('CartoDB.Positron') %>% 
+    addCircleMarkers(lng= ~long, lat= ~lat, color= ~pal(price), radius = ~price/10,
+                     label = lapply(labs, htmltools::HTML), labelOptions = labelOptions(textsize = "15px")) %>%
+    leaflet::addLegend("bottomright", pal = pal, values = ~price, title = "Average price",
+              labFormat = labelFormat(suffix = "€"), opacity = 1)
+
+# Contruct boxplot
+fig = plot_ly(df, y = ~Price, color = ~City, type = "box") %>% layout(title = 'Pices by City')
+
+# Combine and show
+p = bscols(m, fig)
+p
+
+```
+
+We can see from the two graphs above that 4 out of the 6 cities are quite similar (Barcelona, Rome, Wien and Berlin), with an average 7-nights per-person price of about 160€. The two "outliers" are London, with a value of 220€ and Amsterdam, which unexpectedly shows a price of almost 350€.
+
+Because we collected a sample dataset of less than 10k observations, we know that our analysis cannot assess that Amsterdam is overrall the most expensive city; that is because in the investigation above we do not control for other factors, such as accomodation and service features.
+
+Proceeding with the order we used in the **Data** section, we will now try to assess if the different groups of variables could be considered a driver for prices.
+
+### 4.1 Host-related variables
+
+We show the relationship between Host-related variables and our prices.
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+
+# Boxplot for qualitative vars
+b1 = plot_ly(df, y = ~Price, color = ~Host.Response.Time, type = "box")%>% layout(title = 'Response Time', showlegend=FALSE)
+b2 = plot_ly(df, y = ~Price, color = ~Host.ProfilePic, type = "box")%>% layout(title = 'Profile Pic', showlegend=FALSE)
+b3 = plot_ly(df, y = ~Price, color = ~Host.SuperHost, type = "box")%>% layout(title = 'SuperHost', showlegend=FALSE)
+b4 = plot_ly(df, y = ~Price, color = ~Host.verified, type = "box")%>% layout(title = 'Verified', showlegend=FALSE)
+bscols(b1, b2, b3, b4)
+
+#correlation matrix for quantitative vars
+chart.Correlation(as.matrix(df %>% dplyr::select(Price, Host.Since, Host.Response.Rate)), histogram=TRUE, pch=19)
+```
+
+
+We observe that there is no strong correlation between this group of variables and the prices we computed. 
+
+From these graphs we can extract two main findings:
+
+ * There is a slight but significant correlation between the number of days since the host became active on the platform and the price; this could be due to the fact that experienced host tend to increment the value of their properties over time, maybe adding feature and services that they found relevant in this market.
+ * It seems that higher prices are in some way correlated with faster response time (note that we cannot assess it firmly due to the fact that the confidence bands overlaps, but we can look at the outliers number of each group). This could be an example of a causation-correlation problem: we could (wrongly) suppose that faster response times drive higher prices, but more probably it is higher prices, related to more valuable accomodations, that justify faster response times.
+
+    
+### 4.2 Review-related variables
+
+We show the relationship between review-related variables and our prices.
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Boxplot for qualitative vars
+b1 = plot_ly(df, y = ~Price, color = ~factor(Review.Scores.Accuracy), type = "box")%>% layout(title = 'Accuracy', showlegend=FALSE)
+b2 = plot_ly(df, y = ~Price, color = ~factor(Review.Scores.Cleanliness), type = "box")%>% layout(title = 'Cleanliness', showlegend=FALSE)
+b3 = plot_ly(df, y = ~Price, color = ~factor(Review.Scores.Checkin), type = "box")%>% layout(title = 'Checkin', showlegend=FALSE)
+b4 = plot_ly(df, y = ~Price, color = ~factor(Review.Scores.Communication), type = "box")%>% layout(title = 'Communication', showlegend=FALSE)
+b5 = plot_ly(df, y = ~Price, color = ~factor(Review.Scores.Location), type = "box")%>% layout(title = 'Location', showlegend=FALSE)
+b6 = plot_ly(df, y = ~Price, color = ~factor(Review.Scores.Value), type = "box")%>% layout(title = 'Value', showlegend=FALSE)
+bscols(b1, b2, b3)
+bscols(b4, b5, b6)
+
+#correlation matrix for quantitative vars
+chart.Correlation(as.matrix(df %>% dplyr::select(Price, Number.of.Reviews, Review.Scores.Rating)), histogram=TRUE, pch=19)
+```
+
+
+Before commenting the graphs we need to explain why different kind of reviews (Rating as opposed to the other types) are shown in different plots: that is because the Rating variables could take values in [1, 100] while the other ratings' domain is just [1, 10] (most of the times even [5, 10]), effectively making them qualitative variables instead of quantitative ones.
+
+We observe that there is no strong correlation between the single-category ratings and our prices, this is shown in the boxplots above but we could easily expect this from the summary reported in the **Data** section, where whe showed that for all 6 variables, the 1st Quantile is 9, meaning that 75% of our data assume values between 9 and 10, making the added information of this variables useless.
+
+We still observe small but significant correlations between Number.of.Reviews, Review.Scores.Rating and our prices, we can comment these results as follows:
+
+ * The correlation between the number of reviews and the prices could be driven by the fact that most people leave only negative reviews, that is because the process of reviewing is long and most people follow it just to get some kind of "revenge" over their negative experience.
+ * The correlation between overrall rating and price is significant as expected, we could interpret this in two ways:
+    + A property with better rating could easily increase its price knowing that guests would still be attracted by it.
+    + A property with higher price (and consequently higher value) would be rated higher by Airbnb guest, this is due to the fact that the usual Airbnb guest may be used to low-price and low-value properties (given the fact that most of the properties on the platform are rented rooms).
+
+Because we noticed, both here and in **Data** section, that most of the review variables do not actually add information to our dataset, we remove them as follow:
+
+```{r}
+df = df %>% select(-Review.Scores.Accuracy, -Review.Scores.Cleanliness, -Review.Scores.Checkin,
+                  -Review.Scores.Communication, -Review.Scores.Location, -Review.Scores.Value)
+```
+
+### 4.3 Services-related variables
+
+We show the relationship between services-related variables and our prices.
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Boxplot for qualitative vars
+b1 = plot_ly(df, y = ~Price, color = ~factor(Instant_Bookable), type = "box")%>% layout(title = 'Istant Book', showlegend=FALSE)
+b2 = plot_ly(df, y = ~Price, color = ~factor(Kitchen), type = "box")%>% layout(title = 'Kitchen', showlegend=FALSE)
+b3 = plot_ly(df, y = ~Price, color = ~factor(Washer), type = "box")%>% layout(title = 'Washer', showlegend=FALSE)
+b4 = plot_ly(df, y = ~Price, color = ~factor(Breakfast), type = "box")%>% layout(title = 'Breakfast', showlegend=FALSE)
+b5 = plot_ly(df, y = ~Price, color = ~factor(Air_conditioning), type = "box")%>% layout(title = 'Air Cond', showlegend=FALSE)
+b6 = plot_ly(df, y = ~Price, color = ~factor(Experiences.Offered), type = "box")%>% layout(title = 'Experiences', showlegend=FALSE)
+b7 = plot_ly(df, y = ~Price, color = ~factor(Cancellation.Policy), type = "box")%>% layout(title = 'Canc Policy', showlegend=FALSE)
+bscols(b1, b2, b3, b4, b5)
+bscols(b6, b7)
+```
+
+We start by commenting the basic services (T/F services): the boxplots show that there is no relevant correlation between the presence of one of the services addressed and an higher price; this could be due to the fact that while there are properties that cost more due to this additional services, there are also properties, like hotels, which  have an high price even without this kind of services.
+
+For what it concerns the other two variables we have that:
+
+ * Romantic experiences seems to have a positive impact on prices, this could be explained by the fact that this kind of properties targets the most ready-to-spend market while business, family and social trips tend to look for ceapher properties.
+ * The more strict the cancellation policy, the higher the price; this is another example of a causation-correlation problem, in fact here we could easily assess that hosts who own properties with higher value implements stricter cancellation policies in order not to lose high-spender guests.
+  
+    
+### 4.4 Accomodation-related variables
+
+We show the relationship between accomodation-related variables and our prices.
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Boxplot for qualitative vars
+b1 = plot_ly(df, y = ~Price, color = ~factor(Property.Type), type = "box")%>% layout(title = 'Property Type')
+b2 = plot_ly(df, y = ~Price, color = ~factor(Room.Type), type = "box")%>% layout(title = 'Room Type', showlegend=FALSE)
+b3 = plot_ly(df, y = ~Price, color = ~factor(Bed.Type), type = "box")%>% layout(title = 'Bed Type', showlegend=FALSE)
+bscols(b2, b3)
+b1
+
+chart.Correlation(as.matrix(df %>% dplyr::select(Price, Accommodates, Bathrooms, Bedrooms, Beds, Minimum.Nights)), histogram=TRUE, pch=19)
+```
+
+As expected we have that higher-value room and bed type drive higher prices, this could be seen in the first two graphs which show that a real bed and an entire home are easily correlated with higher prices with respect to couches and shared rooms.
+
+For what it concerns property type we have a variety of them, and, as expected, high-end properties like boats and serviced apartments are correlated to higher prices with respect to low-end ones, like dorms, hostels and tents.
+
+Finally we see that the features of the property, like number of beds/bedrooms, bathrooms and guests are highly correlated with each other as expected. We also find that Accomodates and Beds have a slightly negative but significant impact on price, that could be because properties that accept a lot of guests (like big family houses) leads to discounts on the price-per-person (this dynamic can be seen in all booking platforms, in which renting a property with a lot of people is cheaper than booking a single or double room).
+
+We do find just a slightly relevant correlation with the minumum number of nights to spend at the property; for this reason and for the fact that 75% of our data has a minimum of 3 nights, we exclude the variable from our model as below:
+```{r}
+df = df %>% select(-Minimum.Nights)
+```
+
+# 5. Correlation between variables
+
+We will now show the **qualitative** and **quantitative** correlations between the variables of our dataset:
+```{r, echo=FALSE, fig.width=8}
+quantitative_vars = c("Host.Since","Host.Response.Rate","Accommodates","Bathrooms","Bedrooms","Beds","Price","Number.of.Reviews","Review.Scores.Rating")
+
+corr <- rcorr(as.matrix(df %>% dplyr::select(all_of(quantitative_vars))))
+colnames(corr$r) <- quantitative_vars
+c1 = corrplot(corr$r, type = "upper", tl.col = "black", tl.srt = 45, tl.cex = 1)
+```
+
+
+From the graph above we can see that there is an high correlation between the variables which define the actual property, this is basically due to the fact that a high number of beds leads to a lot of bathrooms for the guests which leads to high square footage etc. This first interpretation is pretty basic and we will not dive deeper into that.
+
+As spotted before we can also see the small correlation between Host.Since and Number of reviews, this could be explained by the fact that a property listed for a long time gets more guests and consequently more reviews.
+
+```{r, echo=FALSE, , fig.height=8}
+qualitative_vars = c("Experiences.Offered", 'Host.Response.Time',"City","Property.Type","Room.Type","Bed.Type","Cancellation.Policy","Host.ProfilePic","Host.SuperHost","Host.verified","Instant_Bookable","Kitchen","Washer","Breakfast","Air_conditioning")
+
+plot(GKtauDataframe(df %>% dplyr::select(all_of(qualitative_vars))))
+```
+
+From the graph above we can start drawing some key findings:
+ 
+ * There is a correlation between instant_bookable and host response time which could be explained by the fact that highly active hosts implement the "instant bookable" feature because they know that they will easily accept guests even with a short notice.
+ * There is a correlation between City and Air conditioning; this could be easily explained by the fact that city with a hotter weather needs to specify the presence of air conditioning that could easily move the choice of the guests.
+ * There is a correlation between property type and breakfast, explained by the fact that high-end properties like hotels and entire apartments easily offer breakfast to their guests while low-end ones, like Hostels and Tents, know that there would be no market for this kind of add-on between their customers.
+ * Finally we notice a correlation between the presence of a Kitchen and the presence of a Washer, easily reconducted to the fact that more "complete" properties like Entire Houses or Apartments usually present both.
+
+# 6. Supervised learning
+
+After this exploratory analysis, which helped us to better visualize and refine our dataset, we start with a supervised learning approach.
+The goal here would be to build a model that can accurately predict the price of a property given its features; this kind of model could be implemented in different use cases such as:
+ 
+ * **Airbnb price recomendation**: the company could help Hosts to evaluate their property in order to be competitive on the market.
+ * **Third party check for guests**: guests could take profit of a third-party model that could easily spot properties with extremely low/high prices with respect to the estimated value.
+ 
+## 6.1 Basic models
+Given the composition of our dataset, that present both quantitative and qualitative variables, we decide to implement a Tree-based algorithm.
+This kind of algorithm is definetly efficent in hybrid datasets and will provide us with great interpretability; in this way we can both get an efficent model and understand which are the main variables that drive Airbnb prices.
+
+We start by estimating a tree over the whole dataset (80-20 train-test split).
+
+```{r, echo=FALSE}
+# Remove useless variables for the model
+df_model = df %>% select(-ID, -Name, -Latitude, -Longitude)
+
+# Train-Test split
+set.seed(42)
+train.full = sample(1:nrow(df_model), nrow(df_model)*.8)
+
+# Tree building
+tree.full = rpart(Price~.,df_model,subset=train.full)
+
+# Tree visualizations
+printcp(tree.full)
+rpart.plot(tree.full)
+```
+
+
+From the tree structure we can easily identify the main drivers for our price variables:
+
+ * **City**: we start by splitting Amsterdam from the other cities, this is due to the fact that, as shown above, this city present relatively higher price than the others. At the second step we also construct a different subtree for London which, as shown above, present prices that are lower than the ones in Amsterdam but still definetly higher than the other cities.
+ * **Room Type**: all the subtrees proceed by separating Private/Private&Shared rooms from entire apartments.
+ * **Accomodates**: at the end all trees proceed by splitting by number of guests that the property can hold, where, as discussed above, more people in the same property lead to lower prices.
+ 
+We now proceed to predict the values for our test set and evaluate them.
+```{r, , echo=FALSE, fig.width=15}
+# Compute test and prediction
+tree.full.pred=predict(tree.full,newdata=df_model[-train.full,])
+df_model.test=df_model[-train.full]$Price
+
+# Compute errors
+error = tree.full.pred - df_model.test
+
+# Plot predictions and residuals
+p1 = qplot(x=tree.full.pred,df_model.test, main='Predictions') + geom_abline(aes(intercept = 0, slope = 1))
+p2 = qplot(error, bins = 30, main='Residuals')
+
+grid.arrange(p1,p2, nrow=1)
+print(paste('Root Mean Squared Error: ', sqrt(mean(error^2))))
+```
+
+We now proceed by trying to estimate different trees for the different cities to see if there is any difference in the nodes:
+```{r, echo=FALSE, fig.width=10,out.width="49%", out.height="50%",fig.cap="caption",fig.show='hold',fig.align='center'}
+# Remove useless variables for the model
+df_model.amsterdam  = df_model %>% filter(City == 'Amsterdam')
+df_model.london     = df_model %>% filter(City == 'London')
+df_model.rome       = df_model %>% filter(City == 'Roma')
+df_model.berlin     = df_model %>% filter(City == 'Berlin')
+df_model.wien       = df_model %>% filter(City == 'Wien')
+df_model.barcelona  = df_model %>% filter(City == 'Barcelona')
+
+# Train-Test split
+train.amsterdam = sample(1:nrow(df_model.amsterdam), nrow(df_model.amsterdam)*.8)
+train.london    = sample(1:nrow(df_model.london), nrow(df_model.london)*.8)
+train.rome      = sample(1:nrow(df_model.rome), nrow(df_model.rome)*.8)
+train.berlin    = sample(1:nrow(df_model.berlin), nrow(df_model.berlin)*.8)
+train.wien      = sample(1:nrow(df_model.wien), nrow(df_model.wien)*.8)
+train.barcelona = sample(1:nrow(df_model.barcelona), nrow(df_model.barcelona)*.8)
+
+
+# Tree building
+tree.amsterdam  = rpart(Price~.,df_model.amsterdam,subset=train.amsterdam)
+tree.london     = rpart(Price~.,df_model.london,subset=train.london)
+tree.rome       = rpart(Price~.,df_model.rome,subset=train.rome)
+tree.berlin     = rpart(Price~.,df_model.berlin,subset=train.berlin)
+tree.wien       = rpart(Price~.,df_model.wien,subset=train.wien)
+tree.barcelona  = rpart(Price~.,df_model.barcelona,subset=train.barcelona)
+
+# Tree visualizations
+rpart.plot(tree.amsterdam) 
+rpart.plot(tree.london)
+rpart.plot(tree.rome)
+rpart.plot(tree.berlin) 
+rpart.plot(tree.wien)
+rpart.plot(tree.barcelona)
+```
+
+From the trees above we can see that the six different datasets construct trees that differs. The nodes that are always present in all six trees are obviously room type and accomodates, which, as seen also above, seems to be the main drivers for the price. The other variables that appears as expected are mainly: 
+
+ * **Host since**: a more experienced host is always correlated with an higher price (as discussed above).
+ * **Air conditioning**: the presence of air conditioning increment the price (almost 50€!).
+ * **Security deposit**: a high security deposit is correlated to an high price, this may be due to the fact that properties that requires a security deposit are more valuable.
+ * **Rating**: as expected an higher rating is correlated to an higher price.
+ * **# Bathrooms**: having more than 1.5 bathrooms (at least 2) is correlated to an higher price.
+    
+## 6.2 Advanced models
+
+At last we try to construct a more robust model in which we try to achieve more accurate results at the expense of some interpretability.
+
+### 6.2.1 Random Forest
+
+We start by evaluating a Random Forest over our full dataset.
+```{r, fig.width=15, echo=FALSE}
+
+rf.full=randomForest(Price~.,data=df_model,subset=train.full)
+rf.full
+
+rf.pred = predict(rf.full,newdata=df_model[-train.full,])
+df_model.test=df_model[-train.full]$Price
+
+# Compute errors
+error = rf.pred - df_model.test
+
+# Plot predictions and residuals
+p1 = qplot(x=tree.full.pred,df_model.test, main='Predictions') + geom_abline(aes(intercept = 0, slope = 1))
+p2 = qplot(error, bins = 30, main='Residuals')
+
+grid.arrange(p1,p2, nrow=1)
+print(paste('Root Mean Squared Error: ', sqrt(mean(error^2))))
+
+```
+
+We can see that this kind of model explain just 56% of the variability of our dataset, and it returns a Root Mean Squared Error of 73.15 (a major improvement from the 80 of the single tree model).
+
+### 6.2.1 Boosting
+
+We proceed by applying boosting.
+```{r, fig.width=15, echo=FALSE}
+
+
+df_boost = df_model
+df_boost$Host.ProfilePic = factor(df_boost$Host.ProfilePic)
+df_boost$Host.SuperHost = factor(df_boost$Host.SuperHost)
+df_boost$Host.verified = factor(df_boost$Host.verified)
+df_boost$Instant_Bookable = factor(df_boost$Instant_Bookable)
+df_boost$Kitchen = factor(df_boost$Kitchen)
+df_boost$Washer = factor(df_boost$Washer)
+df_boost$Breakfast = factor(df_boost$Breakfast)
+df_boost$Air_conditioning = factor(df_boost$Air_conditioning)
+
+boost.full=gbm(Price~.,data=df_boost[train.full,],distribution="gaussian",n.trees=2000,shrinkage=0.01,interaction.depth=4)
+par(mar = c(5, 8, 1, 1))
+summary(boost.full, cBars = 10,las = 2)
+
+boost.pred=predict(boost.full,newdata=df_boost[-train.full,],n.trees=2000)
+df_model.test=df_model[-train.full]$Price
+
+# Compute errors
+error = boost.pred - df_model.test
+
+# Plot predictions and residuals
+p1 = qplot(x=tree.full.pred,df_model.test, main='Predictions') + geom_abline(aes(intercept = 0, slope = 1))
+p2 = qplot(error, bins = 30, main='Residuals')
+
+grid.arrange(p1,p2, nrow=1)
+print(paste('Root Mean Squared Error: ', sqrt(mean(error^2))))
+
+```
+
+We can see from the **Relative influence** plot shown above that the most relevant drivers for prices are the same we found in the single tree model. In this case, as in the RF model, the Root Mean Squared Error lowers, at 73.85.
+
+### 6.2 Conclusions
+
+We can conclude that, while this kind of models gave us a huge help in interpret our dataset, they still seem to slightly underperform. The reason for this could be the fact that our dataset is really heterogeneous, beign composed by cities that differs so much even in the mean price level. Another reason could be the fact that we still do not have all the variables we need to correctly construct a prediction model.
+
+Some *Next steps* in order to improve the performance of our model and perform a more complete analysis could be:
+
+ * Add more relevant variables to the dataset, such as **Distance from city center**.
+ * Implement a **Convolutional Neural Network** that can evaluate the photos of the property and give a rate.
+ * Perform a more accurate analysis that could implement also a time span, as it is possible that **summer/winter season** directly affect the prices shown in the platform (sadly I did not find open data regarding this).
+
+# 7. Unsupervised Learning
+
+Now we will try and approach the problem with unsupervised learning models. This new approach could help us better understand our findings of the analysis above but also show us a different point of view when looking at the dataset.
+
+### 7.1 Principal Component Analysis
+
+We will start from the most famous unsupervised learning model, that can help us identify the principal components in which our data are spread out.
+
+Before computing the model we recall that PCA can only be applied to quantitative variables; this means that even if we expect the results of this model be aligned with our previous findings, we cannot fully rely on this model in order to completely analyse our dataset.
+
+```{r, echo=FALSE, figures-side, fig.show="hold", out.width="50%"}
+# PCA
+df_pca = scale(df %>%dplyr::select(all_of(quantitative_vars)))
+
+pca = FactoMineR::PCA(df_pca, graph=FALSE)
+pca_res = prcomp(df_pca)
+
+p1 = fviz_pca_var(pca, col.var ="contrib", gradient.cols = c("blue", "green"), repel=TRUE)
+p2 = fviz_screeplot(pca, addlabels=TRUE)
+p3 = autoplot(pca_res)
+
+c1 = fviz_contrib(pca, choice='var', axes=1, top=10)
+c2 = fviz_contrib(pca, choice='var', axes=2, top=10)
+c3 = fviz_contrib(pca, choice='var', axes=3, top=10)
+c4 = fviz_contrib(pca, choice='var', axes=4, top=10)
+
+p1
+p2
+p3
+grid.arrange(c1, c2, c3, c4,  nrow = 2)
+```
+
+From the plots above we can see that there is clearly one dimension in which the data are spread out the most, and it is the one related to the actual property (accomodates, beds, bathrooms and bedrooms). 
+
+We then have a second and third dimension, both capturing less than a half of the variability of the first dimension and they are respectively a *value-of-property* dimension, given the fact that the main components are Price, Rating and Host.Since (recall that we interpred experienced host as an added value) and what it seems to be a *popularity* dimension, given the fact that its main component is given by the number of reviews.
+
+This model is aligned with our first analysis, and it assess that the variability of the dataset can be reconducted by group of variables that we already presented as correlated.
+
+Unfortunately we cannot see any clear cluster in the graph reporting the projected dimensions, this could be easily caused by the fact that all qualitative variables were left out from this model.
+
+We shown below that the kmeans algorithm confirm our expectations: we are not able to identify clear clusters just by looking at qunatitative variables.
+
+
+
+```{r, echo=FALSE}
+k.means.fit = kmeans(df_pca, 2)
+clusplot(df_pca, k.means.fit$cluster, main='Cluster representation', color=TRUE, shade=TRUE, labels=2, lines=0)
+
+```
+
+As expected the two clusters we get (that seems to try and separate *small* properties, with low number of beds and accomodetes from *large* ones) are completely overlapped. 
+
+### 7.2 Hierarchical Clustering
+
+Given what we said aboce, we will now try to compute different cluster using hierarchical clustering; in this way we would be able to add also qualitative variables to our analysis, hopefully improving the model.
+
+In order to evaluate the model with both quantitative and qualitative variables we use the Gower distance.
+
+We start by trying to compute 6 clusters (that we hope to reconduct to our 6 cities). We will remove in this analysis the variable **City** in order to actually understand if there our cities actually differs.
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Compute hierarchical clustering
+hier_df = df %>% dplyr::select(all_of(c(quantitative_vars, qualitative_vars)))
+d_matrix = cluster::daisy(hier_df %>% select(-City) , metric = "gower")
+H.fit = hclust(d_matrix, method="ward.D2")
+groups <- cutree(H.fit, k=6)
+
+
+# Generate auxiliary df
+map_df = df
+map_df$label = groups
+
+pal <- colorNumeric(
+  palette = "viridis",
+  domain = map_df$label)
+
+# Generate maps
+tmp_map_amsterdam <-leaflet(map_df %>% filter(City=='Amsterdam')) %>% addProviderTiles('CartoDB.Positron') %>% 
+addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(label), radius=1, label =  ~label) %>%
+addLegend(pal = pal, values = ~label, title = "Cluster",
+labFormat = labelFormat())
+
+tmp_map_london <-leaflet(map_df %>% filter(City=='London')) %>% addProviderTiles('CartoDB.Positron') %>% 
+addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(label), radius=1, label =  ~label) %>%
+addLegend(pal = pal, values = ~label, title = "Cluster",
+labFormat = labelFormat())
+
+tmp_map_rome <-leaflet(map_df %>% filter(City=='Roma')) %>% addProviderTiles('CartoDB.Positron') %>% 
+addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(label), radius=1, label =  ~label) %>%
+addLegend(pal = pal, values = ~label, title = "Cluster",
+labFormat = labelFormat())
+
+tmp_map_berlin <-leaflet(map_df %>% filter(City=='Berlin')) %>% addProviderTiles('CartoDB.Positron') %>% 
+addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(label), radius=1, label =  ~label) %>%
+addLegend(pal = pal, values = ~label, title = "Cluster",
+labFormat = labelFormat())
+
+tmp_map_wien <-leaflet(map_df %>% filter(City=='Wien')) %>% addProviderTiles('CartoDB.Positron') %>% 
+addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(label), radius=1, label =  ~label) %>%
+addLegend(pal = pal, values = ~label, title = "Cluster",
+labFormat = labelFormat())
+
+tmp_map_barcelona <-leaflet(map_df %>% filter(City=='Barcelona')) %>% addProviderTiles('CartoDB.Positron') %>% 
+addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(label), radius=1, label =  ~label) %>%
+addLegend(pal = pal, values = ~label, title = "Cluster",
+labFormat = labelFormat())
+
+
+# display dendogram
+plot(H.fit) 
+rect.hclust(H.fit, k=6, border="red")
+
+#Display map
+bscols(tmp_map_amsterdam, tmp_map_london, tmp_map_rome)
+bscols(tmp_map_berlin, tmp_map_wien, tmp_map_barcelona)
+```
+
+
+From the graphs above we can see that there is not actual difference and the 6 clusters seems to overlap in each of the cities.
+
+We will now try the same method but with a small number of cluster, in order to understand if there are some differences between properties that are not related to the city but maybe could be related by different locations in the cities
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+# Compute new clusters
+groups <- cutree(H.fit, k=2)
+
+
+# Generate auxiliary df
+map_df = df
+map_df$label = groups
+
+pal <- colorNumeric(
+  palette = "viridis",
+  domain = map_df$label)
+
+# Generate maps
+tmp_map_amsterdam <-leaflet(map_df %>% filter(City=='Amsterdam')) %>% addProviderTiles('CartoDB.Positron') %>% 
+addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(label), radius=1, label =  ~label) %>%
+addLegend(pal = pal, values = ~label, title = "Cluster",
+labFormat = labelFormat())
+
+tmp_map_london <-leaflet(map_df %>% filter(City=='London')) %>% addProviderTiles('CartoDB.Positron') %>% 
+addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(label), radius=1, label =  ~label) %>%
+addLegend(pal = pal, values = ~label, title = "Cluster",
+labFormat = labelFormat())
+
+tmp_map_rome <-leaflet(map_df %>% filter(City=='Roma')) %>% addProviderTiles('CartoDB.Positron') %>% 
+addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(label), radius=1, label =  ~label) %>%
+addLegend(pal = pal, values = ~label, title = "Cluster",
+labFormat = labelFormat())
+
+tmp_map_berlin <-leaflet(map_df %>% filter(City=='Berlin')) %>% addProviderTiles('CartoDB.Positron') %>% 
+addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(label), radius=1, label =  ~label) %>%
+addLegend(pal = pal, values = ~label, title = "Cluster",
+labFormat = labelFormat())
+
+tmp_map_wien <-leaflet(map_df %>% filter(City=='Wien')) %>% addProviderTiles('CartoDB.Positron') %>% 
+addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(label), radius=1, label =  ~label) %>%
+addLegend(pal = pal, values = ~label, title = "Cluster",
+labFormat = labelFormat())
+
+tmp_map_barcelona <-leaflet(map_df %>% filter(City=='Barcelona')) %>% addProviderTiles('CartoDB.Positron') %>% 
+addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(label), radius=1, label =  ~label) %>%
+addLegend(pal = pal, values = ~label, title = "Cluster",
+labFormat = labelFormat())
+
+
+# display dendogram
+plot(H.fit) 
+rect.hclust(H.fit, k=2, border="red")
+
+#Display map
+bscols(tmp_map_amsterdam, tmp_map_london, tmp_map_rome)
+bscols(tmp_map_berlin, tmp_map_wien, tmp_map_barcelona)
+```
+
+As can be see from the graph above we did not get the results that we expected, the clusters seems to overlap in all the cities without any geographical meaning.
+
+We will now try and define different clustering models, one for each city, in order to understand if our data can be grouped in a way that has some geographical interpretation.
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+map_list = list()
+
+for (i in seq_along(CITIES)){
+  
+  city = CITIES[[i]]
+  # Compute hierarchical clustering
+  hier_df_single = df %>% dplyr::select(all_of(c(quantitative_vars, qualitative_vars)))%>% filter(City==city)
+  d_matrix = cluster::daisy(hier_df_single %>% select(-City) , metric = "gower")
+  H.fit = hclust(d_matrix, method="ward.D2")
+  groups <- cutree(H.fit, k=2)
+  
+  
+  # Generate auxiliary df
+  map_df = df%>% filter(City==city)
+  map_df$label = groups
+  
+  pal <- colorNumeric(
+  palette = "viridis",
+  domain = map_df$label)
+  
+  # Generate maps
+  map_list[[i]] = leaflet(map_df %>% filter(City==city)) %>% addProviderTiles('CartoDB.Positron') %>% 
+  addCircleMarkers(lng= ~Longitude, lat= ~Latitude, color= ~pal(label), radius=1, label =  ~label) %>%
+  addLegend(pal = pal, values = ~label, title = "Cluster",
+  labFormat = labelFormat())
+}
+
+bscols(map_list[[1]], map_list[[2]], map_list[[3]])
+bscols(map_list[[4]], map_list[[5]], map_list[[6]])
+
+
+```
+
+We can notice that in some cities (like London and Berlin) there seems to be a slightly geographical interpretation of the clusters, but they still seem to overlap in most part of the city.
+
+### 7.3 Conclusions
+
+This unsupervised approach definetly helped us for the first part. in identifying the principal components in which our data are spread out.
+
+Unfortunately we did not obtain the result that we expected in the clustering analysis; this could be due to the fact that we have a lot of variables (like host-related) that are not correlated to the construction of geographical clusters.
+
+Some *Next steps* for this kind of analysis would be:
+
+ * Same as before, adding some variables that could help us better cluster our data.
+ * Try and work with non-geographical clusters in order to assess if there is any other way in which uor data can be grouped.
+ * Try and work with lesser variables in order to better interpret and identify geographical clusters
